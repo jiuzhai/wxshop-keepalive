@@ -1,16 +1,50 @@
 name: keepalive
 
+# 为什么不是「每 5 分钟 ping 一次的短任务」：
+# 2026-11-07 实测 —— 本仓库 cron 配的 */5，12 小时里**只真跑了 3 次**
+# （11-06 21:44 / 11-07 01:18）。GitHub 对低活跃仓库的 schedule 会大幅降频。
+# 而托管实例空闲 10~15 分钟就被回收 ⇒ 05:00 / 08:00 时实例根本不存在，
+# 定时器没有进程可跑，早上那两轮直接空过（现场：booted_at 11:25:42，
+# 而 05:00 与 08:00 一次都没跑）。
+#
+# 改成「一次 run 连续保活 5 小时 50 分、每 60 秒打一次 /healthz」：
+# 触发频率再不准都不致命 —— 只要上一次 run 还活着，实例就一直被唤醒。
+
 on:
   schedule:
-    - cron: '*/5 * * * *'
+ # 每 6 小时一次（错开整点：整点是 GitHub 调度最挤的时候）
+    - cron: '7 0,6,12,18 * * *'
   workflow_dispatch:
+
+# 新 run 只排队接续，**不许取消正在保活的那一个**（取消 = 实例立刻没人管）
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+ # GitHub 单 job 上限 6 小时；循环自己在 5h50m 时退出，留 10 分钟余量
+    timeout-minutes: 360
     steps:
-      - name: ping healthz
+      - name: 持续保活（每 60 秒一次）
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" -m 25 \
-            https://wxshop-kol-board.app.workbuddy.host/healthz || echo 000)
-          echo "healthz -> $code"
+          URL="https://wxshop-kol-board.app.workbuddy.host/healthz"
+          END=$(( $(date +%s) + 5*3600 + 50*60 ))
+          N=0
+          BAD=0
+          echo "开始保活，预计到 $(date -u -d @$END +%H:%M:%SZ)"
+          while [ "$(date +%s)" -lt "$END" ]; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 25 "$URL" || echo 000)
+            N=$((N + 1))
+            case "$CODE" in
+              2*) ;;
+              *) BAD=$((BAD + 1)) ;;
+            esac
+            # 每 30 次（约半小时）打一行，日志不刷屏；失败则逐次打印
+            if [ $((N % 30)) -eq 0 ] || [ "$CODE" != "200" ]; then
+              echo "$(date -u +%H:%M:%S) #$N -> $CODE（累计失败 $BAD）"
+            fi
+            sleep 60
+          done
+          echo "本轮结束：$N 次，非 2xx $BAD 次"
